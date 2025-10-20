@@ -1,0 +1,38 @@
+{
+  "environment": "production",
+  "aws_region": "us-east-1",
+  "stack_name": "FitnessCoachStack",
+  "api_settings": {
+    "rate_limit": 100,
+    "burst_limit": 200,
+    "quota_limit": 10000,
+    "quota_period": "DAY"
+  },
+  "lambda_settings": {
+    "timeout_seconds": 30,
+    "memory_mb": 512,
+    "reserved_concurrency": {
+      "main_handler": 10,
+      "workout_generator": 5,
+      "meal_planner": 5
+    }
+  },
+  "dynamodb_settings": {
+    "billing_mode": "PAY_PER_REQUEST",
+    "ttl_hours": 24
+  },
+  "monitoring": {
+    "log_retention_days": 30,
+    "alarm_thresholds": {
+      "error_rate_percent": 5,
+      "latency_seconds": 10,
+      "throttle_count": 1
+    }
+  },
+  "security": {
+    "api_key_required": true,
+    "cors_enabled": true,
+    "request_validation": true,
+    "max_request_size_mb": 1
+  }
+}

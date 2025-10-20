@@ -1,0 +1,3 @@
+# Meal planner Lambda requirements
+boto3>=1.34.0
+requests>=2.31.0

@@ -1,0 +1,14 @@
+{
+  "MCP_SERVERS": {
+    "fitness_knowledge": {
+      "endpoint": "http://localhost:8001",
+      "health_check": "/health",
+      "timeout": 30
+    },
+    "spoonacular_enhanced": {
+      "endpoint": "http://localhost:8002",
+      "health_check": "/health",
+      "timeout": 30
+    }
+  }
+}

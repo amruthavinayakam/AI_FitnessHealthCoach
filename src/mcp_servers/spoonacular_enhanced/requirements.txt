@@ -1,0 +1,3 @@
+# Spoonacular Enhanced MCP Server Dependencies
+# Note: asyncio, dataclasses, typing, hashlib, json, time are built-in modules
+# aiohttp  # Uncomment for production Spoonacular API integration

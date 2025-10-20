@@ -1,0 +1,2 @@
+# Fitness Knowledge MCP Server Dependencies
+# Note: asyncio, dataclasses, typing are built-in modules in Python 3.7+
