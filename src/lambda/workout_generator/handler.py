@@ -4,336 +4,333 @@ import logging
 import os
 import boto3
 import asyncio
-from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
 import re
 import sys
+from typing import Dict, Any, List
 
-# Import shared models
-sys.path.append('/opt/python')  # Lambda layer path
-sys.path.append('../shared')    # Local development path
+# ---------- Imports from your shared layer ----------
+sys.path.append('/opt/python')   # Lambda layer path
+sys.path.append('../shared')     # Local dev path
 
 try:
     from models import WorkoutPlan, DailyWorkout, Exercise, UserProfile
-    from logging_utils import (
-        get_logger, log_api_request, log_function_call,
-        log_external_service_call, log_performance_metric
-    )
+    from logging_utils import get_logger
 except ImportError:
-    # Fallback for local development
-    import importlib.util
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-
-    models_path = os.path.join(current_dir, "..", "..", "shared", "models.py")
-    spec = importlib.util.spec_from_file_location("models", models_path)
-    models = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(models)
+    import importlib.util, pathlib
+    base = pathlib.Path(__file__).resolve().parents[2]
+    # models
+    m = importlib.util.spec_from_file_location("models", str(base / "shared" / "models.py"))
+    models = importlib.util.module_from_spec(m)
+    m.loader.exec_module(models)
     WorkoutPlan = models.WorkoutPlan
     DailyWorkout = models.DailyWorkout
     Exercise = models.Exercise
     UserProfile = models.UserProfile
-
-    logging_path = os.path.join(current_dir, "..", "..", "shared", "logging_utils.py")
-    spec = importlib.util.spec_from_file_location("logging_utils", logging_path)
-    logging_utils = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(logging_utils)
+    # logging_utils
+    lu = importlib.util.spec_from_file_location("logging_utils", str(base / "shared" / "logging_utils.py"))
+    logging_utils = importlib.util.module_from_spec(lu)
+    lu.loader.exec_module(logging_utils)
     get_logger = logging_utils.get_logger
-    log_api_request = logging_utils.log_api_request
-    log_function_call = logging_utils.log_function_call
-    log_external_service_call = logging_utils.log_external_service_call
-    log_performance_metric = logging_utils.log_performance_metric
 
-# Import Fitness MCP Server
+# Optional: Fitness MCP enrichment
 try:
     from fitness_knowledge.server import FitnessKnowledgeMCPServer
 except ImportError:
-    raise
+    FitnessKnowledgeMCPServer = None
 
-# Initialize structured logger
+# ---------- Logger ----------
 logger = get_logger('workout-generator')
 
 
-# ===============================================================
-# Utility for resilient JSON parsing (handles Bedrock quirks)
-# ===============================================================
-def safe_json_loads(text: str):
-    """Attempt to parse JSON text even if Bedrock adds minor formatting errors."""
+# ======================================================================
+# Robust JSON utilities (tolerant of code fences, quotes, trailing commas)
+# ======================================================================
+_TRAILING_COMMA_RE = re.compile(r",\s*(?=[}\]])")
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+
+
+def _normalize_quotes(s: str) -> str:
+    return (s.replace("“", '"')
+             .replace("”", '"')
+             .replace("‘", "'")
+             .replace("’", "'")
+             .replace("–", "-")
+             .replace("—", "-"))
+
+
+def _strip_noise(s: str) -> str:
+    s = s.strip()
+    s = s.replace("----- RAW BEDROCK RESPONSE START -----", "")
+    s = s.replace("----- RAW BEDROCK RESPONSE END -----", "")
+    return s.strip()
+
+
+def _repair_trailing_commas(s: str) -> str:
+    return _TRAILING_COMMA_RE.sub("", s)
+
+
+def _try_parse_any_json(txt: str) -> dict:
+    """
+    Extract and parse the first valid JSON object from Bedrock response text.
+    Handles code fences, extra commentary, and trailing commas.
+    """
+    s = _normalize_quotes(_strip_noise(txt))
+
+    # Prefer fenced JSON
+    fenced = _CODE_FENCE_RE.search(s)
+    if fenced:
+        s = fenced.group(1)
+
+    # Remove trailing commas and repair JSON
+    s = _repair_trailing_commas(s)
+
+    # If multiple JSON blocks exist, keep the first one
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        s = s[start:end+1]
+
+    # Remove any text after final closing brace
+    s = re.sub(r'}[^}]*$', '}', s, flags=re.DOTALL)
+
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Try to clean up common issues
-        cleaned = text.replace("\u201c", '"').replace("\u201d", '"').replace("“", '"').replace("”", '"')
-        cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned)  # Remove trailing commas
-        try:
-            return json.loads(cleaned)
-        except Exception:
-            # Try extracting JSON block manually
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                candidate = match.group(0)
-                try:
-                    return json.loads(candidate)
-                except Exception:
-                    pass
-            raise Exception("Invalid JSON in Bedrock response after cleanup")
+        return json.loads(s)
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON decode failed ({e}). Attempting cleanup and retry.")
+        # Remove invalid control characters or leftover markdown
+        s = re.sub(r"[^\x20-\x7E\n\r\t]+", "", s)
+        s = _repair_trailing_commas(s)
+        return json.loads(s)
 
 
-# ===============================================================
-# Bedrock Workout Generator
-# ===============================================================
+# =======================================
+# Bedrock Workout Generator (Claude model)
+# =======================================
 class BedrockWorkoutGenerator:
-    """AWS Bedrock client for generating structured workout plans enhanced with Fitness MCP Server."""
+    """Generate structured workout plans via AWS Bedrock (Anthropic Claude)."""
 
     def __init__(self):
-        self.bedrock_client = boto3.client('bedrock-runtime')
+        self.bedrock = boto3.client('bedrock-runtime')
         self.model_id = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-haiku-20240307-v1:0')
         self.max_tokens = int(os.environ.get('BEDROCK_MAX_TOKENS', '2000'))
-        self.temperature = float(os.environ.get('BEDROCK_TEMPERATURE', '0.3'))
-        self.fitness_mcp = FitnessKnowledgeMCPServer()
+        self.temperature = float(os.environ.get('BEDROCK_TEMPERATURE', '0.1'))
+        self.top_p = float(os.environ.get('BEDROCK_TOP_P', '0.9'))
+        self.enable_mcp = os.environ.get("ENABLE_FITNESS_MCP", "true").lower() == "true"
+        self.fitness_mcp = FitnessKnowledgeMCPServer() if (FitnessKnowledgeMCPServer and self.enable_mcp) else None
 
+    # ---------- Public ----------
     def generate_workout_plan(self, user_profile: UserProfile) -> WorkoutPlan:
-        """Generate a structured workout plan using AWS Bedrock enhanced with Fitness MCP Server."""
+        prompt_user, prompt_system = self._build_prompts(user_profile)
+
+        # 1) First attempt
+        raw = self._call_bedrock(prompt_user, prompt_system)
+        logger.info("✅ Bedrock API responded successfully.")
+        logger.debug(f"Raw Bedrock output (first 500 chars): {raw[:500]}")
+
         try:
-            prompt = self._create_workout_prompt(user_profile)
-            response = self._call_bedrock_api(prompt)
-            logger.info(f"\n----- RAW BEDROCK RESPONSE START -----\n{response[:2000]}\n----- RAW BEDROCK RESPONSE END -----")
-
-            workout_plan = self._parse_workout_response(response, user_profile)
-            enhanced_workout_plan = asyncio.run(self._enhance_workout_with_mcp(workout_plan))
-
-            logger.info(f"Successfully generated enhanced workout plan for user {user_profile.user_id}")
-            return enhanced_workout_plan
-
-        except Exception as e:
-            logger.error(f"Error generating workout plan: {str(e)}")
-            raise
-
-    # ===============================================================
-    # Prompt builder
-    # ===============================================================
-    def _create_workout_prompt(self, user_profile: UserProfile) -> str:
-        prompt = f"""You are a professional fitness coach creating a personalized 7-day workout plan. 
-
-USER REQUEST: {user_profile.query}
-
-REQUIREMENTS:
-- Create exactly 7 daily workouts (Monday through Sunday)
-- Each workout should be 30-60 minutes total
-- Include 4-8 exercises per day
-- Vary muscle groups across the week
-- Consider progressive overload principles
-- Include rest or active recovery days as appropriate
-
-RESPONSE FORMAT (JSON):
-{{
-    "plan_type": "string (e.g., 'Strength Training', 'Weight Loss', 'Muscle Building')",
-    "duration_weeks": 1,
-    "daily_workouts": [
-        {{
-            "day": "Monday",
-            "total_duration": 45,
-            "notes": "Focus on upper body strength",
-            "exercises": [
-                {{
-                    "name": "Push-ups",
-                    "sets": 3,
-                    "reps": "12-15",
-                    "duration": 8,
-                    "muscle_groups": ["chest", "triceps", "shoulders"]
-                }},
-                {{
-                    "name": "Plank",
-                    "sets": 3,
-                    "reps": "30-60 seconds",
-                    "duration": 5,
-                    "muscle_groups": ["core", "shoulders"]
-                }}
-            ]
-        }}
-    ]
-}}
-
-GUIDELINES:
-- Use realistic rep ranges (e.g., "8-12", "30 seconds", "10 per side")
-- Duration in minutes
-- lowercase muscle groups
-- 7 days total, 4–8 exercises per day
-- JSON only, no explanations or markdown formatting
-
-Generate a complete 7-day workout plan following this exact JSON format:
-"""
-        return prompt
-
-    # ===============================================================
-    # Bedrock API call
-    # ===============================================================
-    def _call_bedrock_api(self, prompt: str) -> str:
-        """Call AWS Bedrock API with structured prompt, handle bad JSON gracefully."""
-        try:
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": self.max_tokens,
-                "temperature": self.temperature,
-                "top_p": 0.9,
-                "messages": [{"role": "user", "content": prompt}]
-            }
-
-            response = self.bedrock_client.invoke_model(
-                modelId=self.model_id,
-                body=json.dumps(request_body),
-                contentType='application/json',
-                accept='application/json'
+            data = _try_parse_any_json(raw)
+        except Exception as e1:
+            logger.warning(f"First parse failed ({e1}). Retrying with JSON-only reminder.")
+            # 2) Automatic JSON-only retry
+            raw2 = self._call_bedrock(
+                prompt_user + "\n\nREMINDER: Return ONLY a single JSON object. No markdown, no commentary.",
+                prompt_system
             )
-
-            # Read and parse response body
-            raw_bytes = response['body'].read()
+            logger.debug(f"Retry Bedrock output (first 500 chars): {raw2[:500]}")
             try:
-                response_body = json.loads(raw_bytes)
+                data = _try_parse_any_json(raw2)
+            except Exception as e2:
+                logger.error(f"Error parsing Bedrock JSON after retry: {e2}")
+                return self._fallback_plan(user_profile)
+
+        try:
+            plan = self._json_to_plan(data, user_profile)
+        except Exception as e:
+            logger.error(f"JSON->Model conversion failed: {e}")
+            return self._fallback_plan(user_profile)
+
+        if self.fitness_mcp:
+            try:
+                plan = asyncio.run(self._enhance_with_mcp(plan))
             except Exception as e:
-                raise Exception(f"Failed to parse Bedrock envelope: {str(e)}")
+                logger.warning(f"MCP enhancement failed: {e}")
 
-            if 'content' not in response_body or not response_body['content']:
-                raise Exception("Empty response from Bedrock")
+        return plan
 
-            content = response_body['content'][0].get('text', '').strip()
-            if not content:
-                raise Exception("Bedrock returned empty text content")
-
-            logger.info(f"Bedrock API call successful, response length: {len(content)}")
-            return content
-
-        except Exception as e:
-            logger.error(f"Bedrock API call failed: {str(e)}")
-            raise Exception(f"Failed to generate workout plan: {str(e)}")
-
-    # ===============================================================
-    # Response parsing
-    # ===============================================================
-    def _extract_json_text(self, response: str) -> str:
-        """Extract JSON block from model output."""
-        m = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)
-        if m:
-            return m.group(1)
-        m = re.search(r'\{.*\}', response, re.DOTALL)
-        if not m:
-            raise Exception("No JSON object found in Bedrock response")
-        return m.group(0)
-
-    def _parse_workout_response(self, response: str, user_profile: UserProfile) -> WorkoutPlan:
-        """Parse Bedrock JSON safely into structured WorkoutPlan."""
-        try:
-            json_str = self._extract_json_text(response)
-            workout_data = safe_json_loads(json_str)
-
-            required_fields = ['plan_type', 'duration_weeks', 'daily_workouts']
-            for field in required_fields:
-                if field not in workout_data:
-                    raise Exception(f"Missing required field: {field}")
-
-            daily_workouts: List[DailyWorkout] = []
-            expected_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-
-            for workout_item in workout_data['daily_workouts']:
-                if workout_item['day'] not in expected_days:
-                    raise Exception(f"Invalid day: {workout_item['day']}")
-
-                exercises = []
-                for ex in workout_item['exercises']:
-                    exercises.append(Exercise(
-                        name=ex['name'],
-                        sets=int(ex['sets']),
-                        reps=str(ex['reps']),
-                        duration=int(ex['duration']),
-                        muscle_groups=ex['muscle_groups']
-                    ))
-
-                daily_workouts.append(DailyWorkout(
-                    day=workout_item['day'],
-                    exercises=exercises,
-                    total_duration=int(workout_item['total_duration']),
-                    notes=workout_item.get('notes')
-                ))
-
-            plan = WorkoutPlan(
-                user_id=user_profile.user_id,
-                plan_type=workout_data['plan_type'],
-                duration_weeks=int(workout_data['duration_weeks']),
-                daily_workouts=daily_workouts
-            )
-
-            logger.info(f"Successfully parsed workout plan with {len(daily_workouts)} days")
-            return plan
-
-        except Exception as e:
-            logger.error(f"Error parsing Bedrock JSON: {str(e)}")
-            raise Exception(f"Invalid JSON in Bedrock response: {str(e)}")
-
-    # ===============================================================
-    # Enhancement via Fitness MCP
-    # ===============================================================
-    async def _enhance_workout_with_mcp(self, workout_plan: WorkoutPlan) -> WorkoutPlan:
-        try:
-            enhanced_days: List[DailyWorkout] = []
-
-            for day in workout_plan.daily_workouts:
-                enhanced_exs = []
-                for ex in day.exercises:
-                    info = await self.fitness_mcp.get_exercise_info(ex.name)
-                    if "error" not in info:
-                        ex.form_description = info.get("form_description")
-                        ex.safety_notes = "; ".join(info.get("safety_guidelines", [])[:2])
-                    enhanced_exs.append(ex)
-                enhanced_days.append(DailyWorkout(
-                    day=day.day,
-                    exercises=enhanced_exs,
-                    total_duration=day.total_duration,
-                    notes=day.notes
-                ))
-
-            validation = await self.fitness_mcp.validate_workout_balance({
-                "exercises": [ex.name for d in enhanced_days for ex in d.exercises]
-            })
-
-            if not validation.get("balanced", True):
-                note = f"Balance recommendations: {'; '.join(validation.get('recommendations', [])[:2])}"
-                if enhanced_days:
-                    enhanced_days[0].notes = (enhanced_days[0].notes or '') + " | " + note
-
-            return WorkoutPlan(
-                user_id=workout_plan.user_id,
-                plan_type=workout_plan.plan_type,
-                duration_weeks=workout_plan.duration_weeks,
-                daily_workouts=enhanced_days,
-                created_at=workout_plan.created_at
-            )
-
-        except Exception as e:
-            logger.warning(f"Enhancement failed: {str(e)}")
-            return workout_plan
-
-
-# ===============================================================
-# Lambda Handler
-# ===============================================================
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Lambda entry for generating workout plans via AWS Bedrock."""
-    try:
-        if not event or 'body' not in event:
-            raise Exception("Missing request body")
-
-        body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
-        for f in ['username', 'userId', 'query']:
-            if f not in body:
-                raise Exception(f"Missing required field: {f}")
-
-        user_profile = UserProfile(
-            username=body['username'],
-            user_id=body['userId'],
-            query=body['query']
+    # ---------- Internals ----------
+    def _build_prompts(self, user_profile: UserProfile):
+        system = (
+            "You are an API that must return ONLY valid JSON.\n"
+            "Never include code fences, markdown, or any explanation.\n"
+            "Your response MUST begin with '{' and end with '}'."
         )
 
+        user = f"""
+Create a 7-day workout plan for this request: "{user_profile.query}".
+
+Ensure:
+- 7 days (Monday–Sunday)
+- 4–8 exercises per day
+- Each day includes name, sets, reps, duration, and muscle_groups.
+- Respond with one JSON object only.
+- The JSON must strictly match this schema and be syntactically valid:
+
+{{
+  "plan_type": "string",
+  "duration_weeks": 1,
+  "daily_workouts": [
+    {{
+      "day": "Monday",
+      "total_duration": 45,
+      "notes": "Focus on upper body strength",
+      "exercises": [
+        {{
+          "name": "Push-ups",
+          "sets": 3,
+          "reps": "12-15",
+          "duration": 8,
+          "muscle_groups": ["chest", "triceps", "shoulders"]
+        }}
+      ]
+    }}
+  ]
+}}
+"""
+        return user.strip(), system
+
+    def _call_bedrock(self, user_prompt: str, system_prompt: str) -> str:
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": user_prompt}
+            ]
+        }
+        resp = self.bedrock.invoke_model(
+            modelId=self.model_id,
+            body=json.dumps(body),
+            contentType='application/json',
+            accept='application/json'
+        )
+        payload = json.loads(resp["body"].read())
+        if not payload.get("content"):
+            raise RuntimeError("Empty content from Bedrock")
+        text = payload["content"][0].get("text", "")
+        if not text:
+            raise RuntimeError("Bedrock returned empty text block")
+        return text
+
+    def _json_to_plan(self, data: Dict[str, Any], user_profile: UserProfile) -> WorkoutPlan:
+        for k in ("plan_type", "duration_weeks", "daily_workouts"):
+            if k not in data:
+                raise ValueError(f"Missing key: {k}")
+
+        valid_days = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+        daily: List[DailyWorkout] = []
+        for day_obj in data["daily_workouts"]:
+            day = day_obj.get("day")
+            if day not in valid_days:
+                raise ValueError(f"Invalid day value: {day}")
+
+            total_duration = int(day_obj.get("total_duration", 45))
+            notes = day_obj.get("notes", "")
+
+            exs = []
+            for ex in day_obj.get("exercises", []):
+                exs.append(Exercise(
+                    name=ex.get("name", "Exercise"),
+                    sets=int(ex.get("sets", 3)),
+                    reps=str(ex.get("reps", "10-12")),
+                    duration=int(ex.get("duration", 10)),
+                    muscle_groups=[str(m).lower() for m in ex.get("muscle_groups", [])]
+                ))
+
+            daily.append(DailyWorkout(
+                day=day,
+                exercises=exs,
+                total_duration=total_duration,
+                notes=notes
+            ))
+
+        return WorkoutPlan(
+            user_id=user_profile.user_id,
+            plan_type=str(data.get("plan_type", "General Fitness")),
+            duration_weeks=int(data.get("duration_weeks", 1)),
+            daily_workouts=daily
+        )
+
+    def _fallback_plan(self, user_profile: UserProfile) -> WorkoutPlan:
+        logger.error("Falling back to minimal safe plan due to JSON parsing issues.")
+        return WorkoutPlan(
+            user_id=user_profile.user_id,
+            plan_type="General Fitness",
+            duration_weeks=1,
+            daily_workouts=[
+                DailyWorkout(
+                    day="Monday",
+                    total_duration=30,
+                    notes="Fallback plan due to Bedrock parsing error.",
+                    exercises=[
+                        Exercise(name="Bodyweight Squats", sets=3, reps="15", duration=10, muscle_groups=["legs"]),
+                        Exercise(name="Push-ups", sets=3, reps="12", duration=8, muscle_groups=["chest","arms"]),
+                    ]
+                )
+            ]
+        )
+
+    async def _enhance_with_mcp(self, plan: WorkoutPlan) -> WorkoutPlan:
+        if not self.fitness_mcp:
+            return plan
+        enhanced = []
+        for d in plan.daily_workouts:
+            upd = []
+            for ex in d.exercises:
+                try:
+                    info = await self.fitness_mcp.get_exercise_info(ex.name)
+                    if isinstance(info, dict) and "error" not in info:
+                        ex.form_description = info.get("form_description")
+                        ex.safety_notes = "; ".join(info.get("safety_guidelines", [])[:2])
+                except Exception:
+                    pass
+                upd.append(ex)
+            enhanced.append(DailyWorkout(day=d.day, exercises=upd, total_duration=d.total_duration, notes=d.notes))
+
+        try:
+            names = [ex.name for d in enhanced for ex in d.exercises]
+            validation = await self.fitness_mcp.validate_workout_balance({"exercises": names})
+            if not validation.get("balanced", True) and enhanced:
+                tip = "; ".join(validation.get("recommendations", [])[:2])
+                enhanced[0].notes = (enhanced[0].notes + " | " if enhanced[0].notes else "") + f"Balance recommendations: {tip}"
+        except Exception:
+            pass
+
+        return WorkoutPlan(
+            user_id=plan.user_id,
+            plan_type=plan.plan_type,
+            duration_weeks=plan.duration_weeks,
+            daily_workouts=enhanced,
+            created_at=plan.created_at
+        )
+
+
+# ==================
+# Lambda entry point
+# ==================
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    try:
+        if 'body' not in event:
+            raise ValueError("Missing request body")
+        body = json.loads(event['body']) if isinstance(event['body'], str) else (event.get('body') or {})
+        for f in ['username', 'userId', 'query']:
+            if f not in body:
+                raise ValueError(f"Missing required field: {f}")
+
+        user_profile = UserProfile(username=body['username'], user_id=body['userId'], query=body['query'])
         generator = BedrockWorkoutGenerator()
-        workout_plan = generator.generate_workout_plan(user_profile)
+        plan = generator.generate_workout_plan(user_profile)
 
         return {
             'statusCode': 200,
@@ -341,7 +338,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'body': json.dumps({
                 'success': True,
                 'data': {
-                    'workoutPlan': workout_plan.to_dynamodb_item(),
+                    'workoutPlan': plan.to_dynamodb_item(),
                     'sessionId': user_profile.session_id
                 },
                 'message': 'Workout plan generated successfully'

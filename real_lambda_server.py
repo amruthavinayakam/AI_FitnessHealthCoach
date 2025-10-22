@@ -55,7 +55,7 @@ class RealLambdaHandler(BaseHTTPRequestHandler):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🎯 Fitness Health Coach - REAL Lambda Integration</title>
+    <title>Fitness Health Coach</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -164,7 +164,12 @@ class RealLambdaHandler(BaseHTTPRequestHandler):
             white-space: pre-wrap;
             max-height: 400px;
             overflow-y: auto;
+            width: 100%;
+            text-align: left;
+            display: block;
+            box-sizing: border-box;
         }
+
         .footer {
             text-align: center;
             margin-top: 40px;
@@ -175,31 +180,9 @@ class RealLambdaHandler(BaseHTTPRequestHandler):
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎯 Fitness Health Coach</h1>
-            <p><strong>REAL Lambda Integration</strong> - localhost:8080</p>
-            <p style="color: #ffeb3b;">⚡ This server calls your actual AWS Lambda functions!</p>
-        </div>
-        
-        <div class="status-grid">
-            <div class="status-card">
-                <h3>🔧 Lambda Functions</h3>
-                <div class="status-indicator">⚡</div>
-                <p>Calling REAL AWS Lambda functions with Bedrock</p>
-            </div>
-            <div class="status-card">
-                <h3>☁️ AWS Bedrock</h3>
-                <div class="status-indicator">🧠</div>
-                <p>Real AI workout generation via Claude</p>
-            </div>
-            <div class="status-card">
-                <h3>📊 Live Testing</h3>
-                <div class="status-indicator">🚀</div>
-                <p>Direct Lambda invocation from localhost</p>
-            </div>
-        </div>
-        
+            <h1>Fitness Health Coach</h1>
         <div class="demo-section">
-            <h2>🚀 Test REAL Lambda Functions</h2>
+            <h2>Test Lambda Functions</h2>
             <div class="demo-buttons">
                 <button class="demo-btn" onclick="testWorkoutLambda()">💪 Test Workout Generator (Bedrock)</button>
                 <button class="demo-btn" onclick="testMealLambda()">🍽️ Test Meal Planner</button>
@@ -208,17 +191,17 @@ class RealLambdaHandler(BaseHTTPRequestHandler):
         </div>
         
         <div class="demo-section">
-            <h2>💬 Chat with REAL Fitness Coach</h2>
+            <h2>💬 Chat with Fitness Coach</h2>
             <div class="chat-container">
-                <input type="text" class="chat-input" id="userMessage" placeholder="Ask me about fitness, nutrition, or workouts (uses REAL Bedrock!)..." />
+                <input type="text" class="chat-input" id="userMessage" placeholder="Ask me about fitness, nutrition, or workouts." />
                 <button class="chat-btn" onclick="sendChatMessage()">Send to Lambda Functions</button>
-                <div class="response-area" id="responseArea">Ready to call your REAL Lambda functions! 🏋️‍♂️</div>
             </div>
+            <div id="responseArea" class="response-area">🔄 Waiting for response...</div>
         </div>
         
         <div class="footer">
-            <p>🎉 Fitness Health Coach - REAL Lambda Integration</p>
-            <p>⚡ Directly invoking: workout-generator, meal-planner, fitness-coach-handler</p>
+            <p> Fitness Health Coach </p>
+            <p> Directly invoking: workout-generator, meal-planner, fitness-coach-handler</p>
         </div>
     </div>
 
