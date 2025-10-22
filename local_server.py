@@ -438,7 +438,7 @@ class FitnessCoachHandler(BaseHTTPRequestHandler):
     async def get_fitness_info(self, exercise):
         """Get fitness information from MCP server"""
         # Import and use fitness server
-        fitness_path = Path("src/mcp_servers/fitness_knowledge")
+        fitness_path = Path("src/lambda/workout_generator/fitness_knowledge")
         sys.path.insert(0, str(fitness_path))
         
         import importlib.util
