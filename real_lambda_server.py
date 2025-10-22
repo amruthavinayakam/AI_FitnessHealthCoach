@@ -12,6 +12,7 @@ from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 import threading
+import os
 
 class RealLambdaHandler(BaseHTTPRequestHandler):
     """HTTP handler that calls real Lambda functions"""
@@ -467,7 +468,8 @@ class RealLambdaHandler(BaseHTTPRequestHandler):
 
 def run_server():
     """Run the real Lambda server"""
-    server_address = ('localhost', 8080)
+    #server_address = ('localhost', 8080)
+    server_address = ('0.0.0.0', int(os.getenv('PORT', '8080')))
     httpd = HTTPServer(server_address, RealLambdaHandler)
     
     print("🎯 Fitness Health Coach - REAL Lambda Integration Server")
